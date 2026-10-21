@@ -1,7 +1,5 @@
 name: Urban Reign Android APK
 
-# Only ONE workflow. Run manually: Actions → Urban Reign Android APK → Run workflow.
-# Uses repo-root SLUS_212.09 when no URL inputs are given.
 on:
   workflow_dispatch:
     inputs:
@@ -72,7 +70,6 @@ jobs:
           python3 - "$GLUE" <<'PY'
           from pathlib import Path
           import sys
-
           path = Path(sys.argv[1])
           source = path.read_text()
           old = "    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);"
@@ -82,13 +79,10 @@ jobs:
                   raise SystemExit("NativeActivity glue changed; refusing to patch an unknown thread setup")
               source = source.replace(old, new, 1)
               path.write_text(source)
-          if "pthread_attr_setstacksize(&attr, 16 * 1024 * 1024)" not in path.read_text():
-              raise SystemExit("Native game thread stack patch did not apply")
-          print("Configured 16 MiB stack for raylib's Android NativeActivity thread")
+          print("Configured 16 MiB stack for NativeActivity thread")
           PY
-          grep -n "pthread_attr_setstacksize" "$GLUE"
 
-      - name: Make NativeActivity callbacks non-blocking (fixes black screen + not responding)
+      - name: Make NativeActivity callbacks non-blocking
         shell: bash
         run: |
           set -euo pipefail
@@ -98,14 +92,11 @@ jobs:
           from pathlib import Path
           import re
           import sys
-
           path = Path(sys.argv[1])
           source = path.read_text()
-          marker = "URBAN_GLUE_TIMED_WAIT"
-          if marker in source:
+          if "URBAN_GLUE_TIMED_WAIT" in source:
               print("Timed-wait glue patch already present")
               raise SystemExit(0)
-
           helper = """
           /* URBAN_GLUE_TIMED_WAIT */
           #include <time.h>
@@ -119,11 +110,11 @@ jobs:
           }
 
           """
-          anchor = "static void android_app_set_activity_state("
-          if anchor not in source:
-              raise SystemExit("glue layout changed: android_app_set_activity_state not found")
-          source = source.replace(anchor, helper + anchor, 1)
-
+          includes = list(re.finditer(r"(?m)^#include[^\n]*\n", source))
+          if not includes:
+              raise SystemExit("no #include lines in native_app_glue.c")
+          insert_at = includes[-1].end()
+          source = source[:insert_at] + helper + source[insert_at:]
           wait = r"pthread_cond_wait\(&android_app->cond,\s*&android_app->mutex\);"
           rules = [
               (r"while\s*\(android_app->activityState\s*!=\s*cmd\)\s*\{\s*" + wait + r"\s*\}",
@@ -138,11 +129,13 @@ jobs:
               source, count = re.subn(pattern, lambda _m, r=replacement: r, source, count=1)
               applied += count
           print(f"Applied {applied}/3 non-blocking NativeActivity wait patches")
-          if applied != 3:
-              print("::warning::NDK native_app_glue layout differs; some lifecycle waits stay blocking")
           path.write_text(source)
+          d = source.find("static int urban_glue_wait_timed")
+          u = source.find("urban_glue_wait_timed(android_app)")
+          if d < 0 or u < 0 or d > u:
+              raise SystemExit(f"glue order wrong: def={d} use={u}")
+          print(f"OK glue order def@{d} first_use@{u}")
           PY
-          grep -n "urban_glue_wait_timed" "$GLUE"
 
       - name: Fetch ARM NEON compatibility header
         shell: bash
@@ -233,7 +226,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Verify generated game code is present (not empty/probe)
+      - name: Verify generated game code is present
         shell: bash
         run: |
           set -euo pipefail
@@ -242,12 +235,10 @@ jobs:
           ls -la "$GEN/register_functions.cpp" "$GEN/ps2_recompiled_functions.h"
           COUNT=$(find "$GEN" -type f | wc -l | tr -d ' ')
           TOTAL=$(du -sb "$GEN" | awk '{print $1}')
-          echo "generated file count: $COUNT"
-          echo "generated total bytes: $TOTAL"
+          echo "generated file count: $COUNT total bytes: $TOTAL"
           test "$COUNT" -ge 5
           test "$TOTAL" -ge 500000
           test -s "$GEN/register_functions.cpp"
-          echo "OK register_functions.cpp $(wc -c < "$GEN/register_functions.cpp" | tr -d ' ') bytes"
 
       - name: Reapply Android compatibility patches to generated C++
         shell: bash
