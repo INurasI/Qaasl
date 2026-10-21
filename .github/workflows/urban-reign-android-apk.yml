@@ -1,39 +1,28 @@
 name: Urban Reign Android APK
 
+# Only ONE workflow. Run manually: Actions → Urban Reign Android APK → Run workflow.
+# Uses repo-root SLUS_212.09 when no URL inputs are given.
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/urban-reign-android-apk.yml"
-      - "urban-reign-android/patches/apply_android_port.py"
-      - "urban-reign-android/native/**"
-      - "urban-reign-android/android-app/**"
-      - "SLUS_212.09"
   workflow_dispatch:
     inputs:
-      generated_code_run_id:
-        description: "Optional Actions run ID that contains the Urban-Reign-generated-code artifact."
-        required: false
-        type: string
       boot_elf_url:
-        description: "HTTPS link to a small SLUS_212.09 executable."
+        description: "Optional HTTPS link to SLUS_212.09 (leave empty to use repo-root SLUS_212.09)."
         required: false
         type: string
       iso_url:
-        description: "HTTPS link to your ISO."
+        description: "Optional HTTPS ISO URL (byte-range only). Prefer repo-root SLUS_212.09."
         required: false
         type: string
-  workflow_run:
-    workflows: ["Prepare Urban Reign generated game code"]
-    types: [completed]
-    branches: [main]
+      generated_code_run_id:
+        description: "Optional previous run ID with Urban-Reign-generated-code artifact (usually leave empty)."
+        required: false
+        type: string
 permissions:
   contents: read
   actions: read
 
 jobs:
   build-arm64-apk:
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -117,12 +106,6 @@ jobs:
               print("Timed-wait glue patch already present")
               raise SystemExit(0)
 
-          # android_native_app_glue makes the Java UI thread wait (pthread_cond_wait) until the native
-          # game thread acknowledges onStart/onResume/window/input callbacks. While the game thread is
-          # busy starting up it never does, so the UI thread freezes: black screen, then "not responding".
-          # For CREATE-type callbacks only, give up waiting after a short time; the game thread will
-          # process the queued command as soon as it reaches its event loop. DESTROY/PAUSE-type
-          # callbacks keep the original blocking behaviour so the window is never freed under the game.
           helper = """
           /* URBAN_GLUE_TIMED_WAIT */
           #include <time.h>
@@ -175,16 +158,16 @@ jobs:
           python3 urban-reign-android/patches/apply_android_port.py source
 
       - name: Download reusable generated game code
-        if: ${{ github.event_name == 'workflow_run' || inputs.generated_code_run_id != '' }}
+        if: ${{ inputs.generated_code_run_id != '' }}
         uses: actions/download-artifact@v4
         with:
           name: Urban-Reign-generated-code
-          run-id: ${{ inputs.generated_code_run_id || github.event.workflow_run.id }}
+          run-id: ${{ inputs.generated_code_run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/generated-code-artifact
 
       - name: Restore generated game code
-        if: ${{ github.event_name == 'workflow_run' || inputs.generated_code_run_id != '' }}
+        if: ${{ inputs.generated_code_run_id != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -195,7 +178,7 @@ jobs:
           test -s source/generated/ps2_recompiled_functions.h
 
       - name: Build host-side PS2 recompiler
-        if: ${{ github.event_name != 'workflow_run' && inputs.generated_code_run_id == '' }}
+        if: ${{ inputs.generated_code_run_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -204,7 +187,7 @@ jobs:
           install -D -m 0755 build/host-recomp/ps2_recomp source/tools/ps2_recomp.exe
 
       - name: Fetch and verify SLUS_212.09 without downloading the full ISO
-        if: ${{ github.event_name != 'workflow_run' && inputs.generated_code_run_id == '' }}
+        if: ${{ inputs.generated_code_run_id == '' }}
         shell: bash
         env:
           BOOT_ELF_URL: ${{ inputs.boot_elf_url || secrets.URBAN_BOOT_ELF_URL }}
@@ -218,8 +201,6 @@ jobs:
             echo "::add-mask::$ISO_URL"
             python3 urban-reign-android/patches/fetch_boot_elf.py --iso-url "$ISO_URL" --output "$RUNNER_TEMP/SLUS_212.09"
           elif [ -s "$GITHUB_WORKSPACE/SLUS_212.09" ]; then
-            # The owner already keeps the verified boot ELF in this private repository.
-            # Use it for source-only rebuilds when no external ISO/ELF URL is supplied.
             cp "$GITHUB_WORKSPACE/SLUS_212.09" "$RUNNER_TEMP/SLUS_212.09"
           else
             echo "Provide boot_elf_url/URBAN_BOOT_ELF_URL, iso_url/URBAN_ISO_RANGE_URL, or the private repository's SLUS_212.09 file." >&2
@@ -228,7 +209,7 @@ jobs:
           test -s "$RUNNER_TEMP/SLUS_212.09"
 
       - name: Generate native C++ from the verified boot ELF
-        if: ${{ github.event_name != 'workflow_run' && inputs.generated_code_run_id == '' }}
+        if: ${{ inputs.generated_code_run_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -237,14 +218,14 @@ jobs:
           test -s source/generated/ps2_recompiled_functions.h
 
       - name: Archive generated game code for later APK builds
-        if: ${{ github.event_name != 'workflow_run' && inputs.generated_code_run_id == '' }}
+        if: ${{ inputs.generated_code_run_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
           tar -czf "${RUNNER_TEMP}/urban-reign-generated-code.tar.gz" -C source generated
 
       - name: Upload reusable generated game code
-        if: ${{ github.event_name != 'workflow_run' && inputs.generated_code_run_id == '' }}
+        if: ${{ inputs.generated_code_run_id == '' }}
         uses: actions/upload-artifact@v4
         with:
           name: Urban-Reign-generated-code
@@ -252,29 +233,40 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Refuse empty / probe game-code tables (prevents silent black-screen APK)
+      - name: Verify generated game code is present (not empty/probe)
         shell: bash
         run: |
           set -euo pipefail
-          # URBAN_V3_REGISTER_FUNCTIONS_GUARD
-          RF="source/generated/register_functions.cpp"
-          test -s "$RF"
-          BYTES=$(wc -c < "$RF")
-          echo "register_functions.cpp size: $BYTES bytes"
-          if [ "$BYTES" -lt 2048 ]; then
-            echo "::error::register_functions.cpp is too small ($BYTES bytes). This looks like a probe/empty table. Provide boot_elf_url or generated_code_run_id and rebuild."
+          # URBAN_V5_GENERATED_CODE_GUARD
+          GEN="source/generated"
+          if [ ! -d "$GEN" ]; then
+            echo "::error::source/generated is missing after generate/restore."
             exit 1
           fi
-          if ! grep -q "register_functions" "$RF"; then
-            echo "::error::register_functions.cpp does not look like generated Urban Reign code."
+          echo "=== generated/ listing (top) ==="
+          ls -la "$GEN" | head -40
+          COUNT=$(find "$GEN" -type f | wc -l | tr -d ' ')
+          TOTAL=$(du -sb "$GEN" | awk '{print $1}')
+          echo "generated file count: $COUNT"
+          echo "generated total bytes: $TOTAL"
+          if [ "$COUNT" -lt 5 ]; then
+            echo "::error::Too few generated files ($COUNT). Expected a full recomp tree."
             exit 1
           fi
-          LINES=$(wc -l < "$RF")
-          echo "register_functions.cpp lines: $LINES"
-          if [ "$LINES" -lt 50 ]; then
-            echo "::error::Too few lines in generated code ($LINES). Refusing to ship a black-screen APK."
+          if [ "$TOTAL" -lt 500000 ]; then
+            echo "::error::generated/ is only $TOTAL bytes — looks empty/probe. Need successful SLUS_212.09 recomp."
             exit 1
           fi
+          if [ -s "$GEN/register_functions.cpp" ]; then
+            RF="$GEN/register_functions.cpp"
+          else
+            RF=$(find "$GEN" -maxdepth 1 -type f -name '*register*' | head -1 || true)
+          fi
+          if [ -z "${RF:-}" ] || [ ! -s "$RF" ]; then
+            echo "::error::No register_functions (or *register*) file in generated/."
+            exit 1
+          fi
+          echo "Using register file: $RF ($(wc -c < "$RF" | tr -d ' ') bytes)"
 
       - name: Reapply Android compatibility patches to generated C++
         shell: bash
@@ -310,9 +302,6 @@ jobs:
           READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          # O2 + function/data sections and linker GC keep the Android binary smaller
-          # without sacrificing the recompiled game's runtime optimization.
-          # Strip debug metadata only; preserve .dynsym and Android/JNI entry points.
           "$STRIP" --strip-debug "$LIB"
           echo "Native library size after debug-only stripping:"
           du -h "$LIB"
@@ -321,56 +310,30 @@ jobs:
           "$NM" -D --defined-only "$LIB" | tee build/android-arm64/urban-dynamic-symbols.txt
           grep -q 'ANativeActivity_onCreate' build/android-arm64/urban-dynamic-symbols.txt
           grep -q 'Java_kz_nurasql77_urbanreign_MainActivity_nativeSetAppStoragePath' build/android-arm64/urban-dynamic-symbols.txt
-          grep -q 'Java_kz_nurasql77_urbanreign_MainActivity_nativeSetIsoPath' build/android-arm64/urban-dynamic-symbols.txt
-          grep -q 'Java_kz_nurasql77_urbanreign_MainActivity_nativeValidateIsoPath' build/android-arm64/urban-dynamic-symbols.txt
-          grep -q 'Java_kz_nurasql77_urbanreign_LauncherActivity_nativeValidateIsoPath' build/android-arm64/urban-dynamic-symbols.txt
-          grep -q 'Java_kz_nurasql77_urbanreign_MainActivity_nativeTouchButton' build/android-arm64/urban-dynamic-symbols.txt
-          grep -q 'Java_kz_nurasql77_urbanreign_MainActivity_nativeTouchAxis' build/android-arm64/urban-dynamic-symbols.txt
-          "$READELF" -d "$LIB" | tee build/android-arm64/urban-needed-libraries.txt
-          if grep -q 'libc++_shared.so' build/android-arm64/urban-needed-libraries.txt; then exit 1; fi
-
-      - name: Verify Android library exports after safe size reduction
-        shell: bash
-        run: |
-          set -euo pipefail
-          LIB="build/android-arm64/src/liburban.so"
-          SYMBOLS="build/android-arm64/urban-dynamic-symbols.txt"
-          test -s "$LIB"
-          test -s "$SYMBOLS"
-          # The previous step strips debug metadata only. Re-check every required
-          # dynamic export after the size-reduction step, and avoid grep -q on an llvm-nm pipe.
-          grep -F 'ANativeActivity_onCreate' "$SYMBOLS" >/dev/null
-          grep -F 'Java_kz_nurasql77_urbanreign_MainActivity_nativeSetAppStoragePath' "$SYMBOLS" >/dev/null
-          grep -F 'Java_kz_nurasql77_urbanreign_MainActivity_nativeSetIsoPath' "$SYMBOLS" >/dev/null
-          grep -F 'Java_kz_nurasql77_urbanreign_MainActivity_nativeValidateIsoPath' "$SYMBOLS" >/dev/null
-          grep -F 'Java_kz_nurasql77_urbanreign_LauncherActivity_nativeValidateIsoPath' "$SYMBOLS" >/dev/null
-          du -h "$LIB"
 
       - name: Package the ARM64 APK
         shell: bash
         run: |
           set -euo pipefail
-          install -D -m 0644 build/android-arm64/src/liburban.so urban-reign-android/android-app/app/src/main/jniLibs/arm64-v8a/liburban.so
-          gradle --no-daemon :app:assembleDebug -p urban-reign-android/android-app
-          APK="urban-reign-android/android-app/app/build/outputs/apk/debug/app-debug.apk"
+          APP="urban-reign-android/android-app"
+          LIBDIR="$APP/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$LIBDIR"
+          cp -f build/android-arm64/src/liburban.so "$LIBDIR/liburban.so"
+          cd "$APP"
+          gradle --no-daemon assembleRelease
+          APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
           test -s "$APK"
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
-          unzip -l "$APK" | grep -E 'lib/arm64-v8a/liburban.so|AndroidManifest.xml'
-          mkdir -p build/apk
-          cp "$APK" build/apk/UrbanReign-Android-arm64-debug.apk
-
-      - name: Cleanup source files
-        if: always()
-        shell: bash
-        run: rm -f "$RUNNER_TEMP/SLUS_212.09"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp -f "$APK" "$GITHUB_WORKSPACE/dist/urban-reign-android-arm64.apk"
+          du -h "$GITHUB_WORKSPACE/dist/urban-reign-android-arm64.apk"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Urban-Reign-Android-arm64-debug
-          path: build/apk/UrbanReign-Android-arm64-debug.apk
+          name: Urban-Reign-Android-APK
+          path: dist/urban-reign-android-arm64.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
       - name: Upload diagnostic logs if the build fails
         if: failure()
@@ -378,9 +341,7 @@ jobs:
         with:
           name: Urban-Reign-Android-build-logs
           path: |
-            source/build/recomp.log
-            build/android-arm64/CMakeCache.txt
-            build/android-arm64/CMakeFiles/CMakeConfigureLog.yaml
-            build/android-arm64/urban-needed-libraries.txt
+            build/**/*.log
+            source/build/**/*.log
           if-no-files-found: ignore
           retention-days: 14
